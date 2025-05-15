@@ -1,0 +1,248 @@
+---
+title: "6652 DID replication and comparison"
+output: html_notebook
+---
+```{r}
+#load packages
+library(haven)
+library(dplyr)
+library(fixest)
+library(ggplot2)
+```
+
+```{r}
+#DID related packages
+#Goodman-Bacon decomposition
+library(bacondecomp)
+#Honest parallel trend check
+library(HonestDiD)
+#Callaway and Sant'Anna
+library(did)
+#two stage
+library(did2s)
+```
+
+This is the data from Dobin et al. 2018's replication kit.
+```{r}
+#load data (Need to adjust it to your path)
+setwd("C:/Users/au782406/Documents/GIT/adv_metrics_25")
+HRS_long <- read_dta(file.path("data", "HRS_long.dta"))
+
+```
+
+Then we do the sample selection as Liyang and Abraham 2021.
+Note that the important variables here are:
+Time and group related:
+e (treatment cohort): wave_hospdef
+l (time from treatment): evt_time
+t (calendar time): wave
+
+Personal id:
+unique identifier:hhidpn
+
+Outcomes:
+Out of pocket spending: oop_spend
+Labor earnings: riearnsemp
+```{r}
+#Check number of waves
+HRSsample<-
+  HRS_long%>%
+  filter(wave %in% c(7:11))%>%
+  group_by(hhidpn)%>%
+  mutate(nwaves=n())%>%
+  ungroup()
+
+#Keep only with 5 full waves
+HRSsample<-
+  HRSsample%>%
+  filter(nwaves==5)
+
+#Ensure first hospitalization is after wave 7
+HRSsample<-
+  HRSsample%>%
+  group_by(hhidpn)%>%
+  mutate(flag=min(evt_time))%>%
+  ungroup%>%
+  filter(flag<0)
+
+#Fill in index wave within pid
+HRSsample<-
+  HRSsample%>%
+  group_by(hhidpn)%>%
+  mutate(wave_hospdef=min(wave_hosp,na.rm=T))%>%
+  ungroup
+
+#filter on age
+HRSsample<-
+  HRSsample%>%
+  filter(age_hosp<=59)
+
+#Check if nunber of unique individuals as expect  
+HRSsample%>%
+  distinct(hhidpn)
+
+#Here we are done with sample construction and verify the sample size N=656 to be the same as of SA.
+
+HRSsample%>%
+  filter(wave==8&wave_hospdef!=8)%>%
+  summarise(mean=mean(oop_spend))
+
+#Create new index wave
+HRSsample<-
+  HRSsample%>%
+  mutate(index_wavenew=wave-7)
+```
+
+```{r}
+#Q2
+#Column 1
+#TWFE for Out of pocket medical spending
+TWFE_oop_res<-feols(oop_spend~i(evt_time,ref=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+#summary(TWFE)
+
+#TWFE for labor earnings
+TWFE_le_res<-feols(riearnsemp~i(evt_time,ref=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+#iplot(TWFE, 
+#      xlab = 'Time to treatment',
+#      main = 'Event study: Staggered treatment (TWFE)')
+```
+
+
+```{r}
+#SA Table3 column 2
+#IW estimator
+#drop last wave
+IWHRSsample<-
+  HRSsample%>%
+  filter(wave %in% c(7:10))# drop wave 11
+
+IW<-feols(oop_spend~sunab(wave_hospdef,wave,ref.c=11,ref.p=c(-1,-4))|hhidpn+index_wavenew,data=IWHRSsample)
+etable(IW)
+
+feols(riearnsemp~sunab(wave_hospdef,wave,ref.c=11,ref.p=c(-1,-4))|hhidpn+index_wavenew,data=IWHRSsample)
+etable(IW)
+```
+
+```{r}
+#SA Table3 column 2
+feols(oop_spend~i(wave_hospdef,i.evt_time,ref=11,ref2=-1)|hhidpn+index_wavenew,data = HRSsample)
+
+#Note here wave_hospdef==8 is our e==1 cohort, just need to reorganize 
+```
+
+```{r}
+#Q3
+#bacon decomposition (in investigation)
+
+bacon_samp <-
+  HRSsample%>%
+  mutate(treated=if_else(evt_time>=0,1,0))
+
+bacon_samp$filt <- paste(bacon_samp$wave_hosp, bacon_samp$evt_time)
+
+table(bacon_samp$filt)
+bacon_samp <- bacon_samp%>%filter(!filt%in%c("8 3", "9 2", "10 1", "11 0"))
+
+bacon(oop_spend~treated,bacon_samp,id_var = "hhidpn",time_var = "wave")
+
+
+s <-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(m=max(treated))
+
+
+s <-
+  bacon_samp%>%
+  group_by(wave_hospdef)%>%
+  summarise(max=max(evt_time))
+
+s$x <- paste(s$wave_hospdef, s$max)
+
+```
+To carry out DID in a CA way, we need the existence of never treated group. So we need to drop observation in wave 11. Alternatively, we could also use control_group=c("notyettreated") while using data=HRSsample, but the results were a bit weird.
+For the first (and the option presented here), we have the same post-treatment estimates as SA as expected and a bit of different pre-treatment estimates. (Need to understand if it is right)
+```{r}
+#Callaway and Sant'Anna
+CAHRSsample<-
+  HRSsample%>%
+  filter(wave %in% c(7:10))
+CA<-att_gt(yname = "oop_spend",
+           gname="wave_hospdef",
+           idname = "hhidpn",
+           tname="wave",
+           data=CAHRSsample,
+           est_method = "reg")
+summary(CA)
+
+CAeventstudy<-aggte(CA,type ="dynamic")
+summary(CAeventstudy)
+```
+```{r}
+#raw trend of outcome variable mean by treatment cohort (e) and time from treatment (l)
+summarystat_oop<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(oop_spend))
+
+ggplot(data=summarystat_oop,aes(x=evt_time,y=mean,group = wave_hospdef,color=as.factor(wave_hospdef)))+
+  geom_line()
+
+summarystat_oop<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(oop_spend))
+
+ggplot(data=summarystat_oop,aes(x=wave_hospdef,y=mean,group = evt_time,color=as.factor(evt_time)))+
+  geom_line()
+
+summarystat_ind<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(riearnsemp))  
+
+ggplot(data=summarystat_ind,aes(x=evt_time,y=mean,group = wave_hospdef,color=as.factor(wave_hospdef)))+
+  geom_line()
+
+summarystat_oop<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(oop_spend))
+
+ggplot(data=summarystat_ind,aes(x=evt_time,y=mean,group = wave_hospdef,color=as.factor(wave_hospdef)))+
+  geom_line()
+```
+
+
+```{r}
+#Q5 Parallel trends test using Honest approach (Need to double check)
+
+#Take the results from TWFE reg in the beginning and implement Honesest DID
+#Could do it for both TWFE_oop_Res and TWFE_le_res
+#I think the pre we need to put in is 2 (i.e -3 and -2) and post 4 (0,1,2,3). Lukas you can help me double check.The reasoning is based on the example we have look into: they took everything after the ref (-1) as post-period
+
+betahat <- summary(TWFE_oop_res)$coefficients #save the coefficients
+sigma <- summary(TWFE_oop_res)$cov.scaled #save the covariance matrix
+fixest::iplot(TWFE_oop_res)
+delta_rm_results <-
+HonestDiD::createSensitivityResults_relativeMagnitudes(
+                                    betahat = betahat, #coefficients
+                                    sigma = sigma, #covariance matrix
+                                    numPrePeriods = 2, #num. of pre-treatment coefs
+                                    numPostPeriods = 4, #num. of post-treatment coefs
+                                    Mbarvec = seq(0.1,1.5,by=0.2) #values of Mbar
+                                    )
+                                    
+#given the graph now, I may increase the Mbar range a little bit to find the critical value?
+delta_rm_results
+```
+
+```{r}
+originalResults <- HonestDiD::constructOriginalCS(betahat = betahat,
+                                                  sigma = sigma,
+                                                  numPrePeriods = 2,
+                                                  numPostPeriods = 4)
+
+HonestDiD::createSensitivityPlot_relativeMagnitudes(delta_rm_results, originalResults)
+```
+
