@@ -1,0 +1,344 @@
+---
+title: "6652 DID replication and comparison"
+output: html_notebook
+---
+```{r}
+#load packages
+library(haven)
+library(dplyr)
+library(fixest)
+library(ggplot2)
+```
+
+```{r}
+#DID related packages
+#Goodman-Bacon decomposition
+library(bacondecomp)
+#Honest parallel trend check
+library(HonestDiD)
+#Callaway and Sant'Anna
+library(did)
+#two stage
+library(did2s)
+```
+
+This is the data from Dobin et al. 2018's replication kit.
+```{r}
+#load data (Need to adjust it to your path)
+HRS_long <- read_dta("Library/CloudStorage/OneDrive-Aarhusuniversitet/2025 Spring/6652 Advanced Econometrics/dir/HRS_long.dta")
+
+```
+
+Then we do the sample selection as Liyang and Abraham 2021.
+Note that the important variables here are:
+Time and group related:
+e (treatment cohort): wave_hospdef
+l (time from treatment): evt_time
+t (calendar time): wave
+
+Personal id:
+unique identifier:hhidpn
+
+Outcomes:
+Out of pocket spending: oop_spend
+Labor earnings: riearnsemp
+```{r}
+#Check number of waves
+HRSsample<-
+  HRS_long%>%
+  filter(wave %in% c(7:11))%>%
+  group_by(hhidpn)%>%
+  mutate(nwaves=n())%>%
+  ungroup()
+
+#Keep only with 5 full waves
+HRSsample<-
+  HRSsample%>%
+  filter(nwaves==5)
+
+#Ensure first hospitalization is after wave 7
+HRSsample<-
+  HRSsample%>%
+  group_by(hhidpn)%>%
+  mutate(flag=min(evt_time))%>%
+  ungroup%>%
+  filter(flag<0)
+
+#Fill in index wave within pid
+HRSsample<-
+  HRSsample%>%
+  group_by(hhidpn)%>%
+  mutate(wave_hospdef=min(wave_hosp,na.rm=T))%>%
+  ungroup
+
+#filter on age
+HRSsample<-
+  HRSsample%>%
+  filter(age_hosp<=59)
+
+#Check if nunber of unique individuals as expect  
+HRSsample%>%
+  distinct(hhidpn)
+
+#Here we are done with sample construction and verify the sample size N=656 to be the same as of SA.
+HRSsample%>%
+  filter(wave==8&wave_hospdef!=8)%>%
+  summarise(mean=mean(oop_spend))
+
+#Create new index wave
+HRSsample<-
+  HRSsample%>%
+  mutate(index_wavenew=wave-7)
+```
+
+```{r}
+#Q2
+#Table 3 Column 1
+#TWFE for Out of pocket medical spending
+TWFE_oop_res<-feols(oop_spend~i(evt_time,ref=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+etable(TWFE_oop_res)
+iplot(TWFE_oop_res)
+
+#TWFE for labor earnings
+TWFE_le_res<-feols(riearnsemp~i(evt_time,ref=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+etable(TWFE_le_res)
+iplot(TWFE_le_res)
+#iplot(TWFE, 
+#      xlab = 'Time to treatment',
+#      main = 'Event study: Staggered treatment (TWFE)')
+```
+
+
+```{r}
+#SA Table3 column 2
+#IW estimator
+#drop last wave
+IWHRSsample<-
+  HRSsample%>%
+  filter(wave %in% c(7:10))# drop wave 11
+
+#out of pocket spending
+IW_oop_res<-feols(oop_spend~sunab(wave_hospdef,wave,ref.c=11,ref.p=c(-1,-4))|hhidpn+index_wavenew,data=IWHRSsample)
+etable(IW_oop_res)
+iplot(IW_oop_res, xlab = "Relative time to treatment (in wave)", col = "steelblue", ref.line = -1)
+
+#labor earnings
+IW_le_res<-feols(riearnsemp~sunab(wave_hospdef,wave,ref.c=11,ref.p=c(-1,-4))|hhidpn+index_wavenew,data=IWHRSsample)
+etable(IW_le_res)
+iplot(IW_le_res, xlab = "Relative time to treatment (in wave)", col = "steelblue", ref.line = -1)
+```
+
+
+
+```{r}
+#SA Table3 column 3
+CATT_oop<-feols(oop_spend~i(wave_hospdef,i.evt_time,ref=11,ref2=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+etable(CATT_oop)
+
+CATT_le<-feols(riearnsemp~i(wave_hospdef,i.evt_time,ref=11,ref2=c(-1,-4))|hhidpn+index_wavenew,data = HRSsample)
+etable(CATT_le)
+#Note here wave_hospdef==8 is our e==1 cohort, just need to reorganize 
+```
+
+```{r}
+#Q3 
+#bacon decomposition
+HRSsample<-
+  HRSsample%>%
+  mutate(treated=if_else(evt_time>=0,1,0))
+bacon(oop_spend~treated,HRSsample,id_var = "hhidpn",time_var = "wave")
+
+#We have obtained 4^2-4=12 weights.
+```
+
+
+To carry out DID in a CA way: Since we do not have a never treated group, we could alternatively use control_group=c("notyettreated") while using data=HRSsample, but the results were a bit weird.
+For the first (and the option presented here), we have the same post-treatment estimates as SA as expected and a bit of different pre-treatment estimates. (Need to understand if it is right)
+```{r}
+#Callaway and Sant'Anna 
+CAHRSsample<-
+  HRSsample%>%
+  filter(wave %in% c(7:10))
+CA_oop<-att_gt(yname = "oop_spend",
+           gname="wave_hospdef",
+           idname = "hhidpn",
+           tname="wave",
+           data=CAHRSsample,
+           est_method = "reg")
+summary(CA_oop)
+
+CAoopeventstudy<-aggte(CA_oop,type ="dynamic")
+summary(CAoopeventstudy)
+ggdid(CAoopeventstudy,xlab="Time to treatment (wave)", ylab = "Effect on Out-of-Pocket Spending", title = "Event Study Treatment Effect (Callaway and Sant'Anna 2021)")
+
+CA_ind<-att_gt(yname = "riearnsemp",
+           gname="wave_hospdef",
+           idname = "hhidpn",
+           tname="wave",
+           data=CAHRSsample,
+           est_method = "reg")
+summary(CA_ind)
+
+CAindeventstudy<-aggte(CA_ind,type ="dynamic")
+summary(CAindeventstudy)
+ggdid(CAindeventstudy,xlab="Time to treatment (wave)", ylab = "Effect on Labor Eanings", title = "Event Study Treatment Effect (Callaway and Sant'Anna 2021)")
+```
+
+```{r}
+CA_oop_alt<-att_gt(yname = "oop_spend",
+           gname="wave_hospdef",
+           idname = "hhidpn",
+           tname="wave",
+           data=HRSsample,
+           control_group=c("notyettreated"),
+           est_method = "reg")
+CAoopeventstudy_alt<-aggte(CA_oop_alt,type="dynamic")
+summary(CAoopeventstudy_alt)
+
+ggdid(CAoopeventstudy_alt,xlab="Time to treatment (wave)", ylab = "Effect on Out-of-Pocket Spending", title = "Event Study Treatment Effect (Callaway and Sant'Anna 2021)")
+
+CA_ind_alt<-att_gt(yname = "riearnsemp",
+           gname="wave_hospdef",
+           idname = "hhidpn",
+           tname="wave",
+           data=HRSsample,
+           control_group=c("notyettreated"),
+           est_method = "reg")
+CAindeventstudy_alt<-aggte(CA_ind_alt,type="dynamic")
+summary(CAindeventstudy_alt)
+
+ggdid(CAindeventstudy_alt,xlab="Time to treatment (wave)", ylab = "Effect on Labor Eanings", title = "Event Study Treatment Effect (Callaway and Sant'Anna 2021)")
+```
+
+
+```{r}
+#raw trend of outcome variable mean by treatment cohort (e) and time from treatment (l)
+summarystat_oop<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(oop_spend))
+
+ggplot(data=summarystat_oop,aes(x=evt_time,y=mean,group = wave_hospdef,color=as.factor(wave_hospdef)))+
+  geom_line()
+
+summarystat_ind<-
+  HRSsample%>%
+  group_by(wave_hospdef,evt_time)%>%
+  summarise(mean=mean(riearnsemp))  
+
+ggplot(data=summarystat_ind,aes(x=evt_time,y=mean,group = wave_hospdef,color=as.factor(wave_hospdef)))+
+  geom_line()
+```
+
+
+```{r}
+#Q5 Parallel trends test using Honest approach (Need to double check)
+
+#Take the results from TWFE reg in the beginning and implement Honesest DID
+#Could do it for both TWFE_oop_Res and TWFE_le_res
+#I think the pre we need to put in is 2 (i.e -3 and -2) and post 4 (0,1,2,3). Lukas you can help me double check.The reasoning is based on the example we have look into: they took everything after the ref (-1) as post-period
+
+betahat_oop<- summary(TWFE_oop_res)$coefficients #save the coefficients
+sigma_oop <- summary(TWFE_oop_res)$cov.scaled #save the covariance matrix
+fixest::iplot(TWFE_oop_res)
+delta_rm_results_oop<-
+HonestDiD::createSensitivityResults_relativeMagnitudes(
+                                    betahat = betahat_oop, #coefficients
+                                    sigma = sigma_oop, #covariance matrix
+                                    numPrePeriods = 2, #num. of pre-treatment coefs
+                                    numPostPeriods = 4, #num. of post-treatment coefs
+                                    Mbarvec = seq(0.2,2,by=0.3) #values of Mbar
+                                    )
+                                    
+#given the graph now, I may increase the Mbar range a little bit to find the critical value?
+delta_rm_results_oop
+
+originalResults_oop <- HonestDiD::constructOriginalCS(betahat = betahat_oop,
+                                                  sigma = sigma_oop,
+                                                  numPrePeriods = 2,
+                                                  numPostPeriods = 4)
+
+HonestDiD::createSensitivityPlot_relativeMagnitudes(delta_rm_results_oop, originalResults_oop)
+
+#Need to do something different for labor earnings!!!!Ideally check evt_time=+2 and +3
+
+```
+
+```{r}
+betahat_le<- summary(TWFE_le_res)$coefficients #save the coefficients
+sigma_le <- summary(TWFE_le_res)$cov.scaled #save the covariance matrix
+fixest::iplot(TWFE_le_res)
+delta_rm_results_le <-
+HonestDiD::createSensitivityResults_relativeMagnitudes(
+                                    betahat = betahat_le, #coefficients
+                                    sigma = sigma_le, #covariance matrix
+                                    numPrePeriods = 2, #num. of pre-treatment coefs
+                                    numPostPeriods = 4, #num. of post-treatment coefs
+                                    Mbarvec = seq(0.2,2,by=0.3) #values of Mbar
+                                    )
+                                    
+delta_rm_results_le
+
+originalResults_le <- HonestDiD::constructOriginalCS(betahat = betahat_le,
+                                                  sigma = sigma_le,
+                                                  numPrePeriods = 2,
+                                                  numPostPeriods = 4)
+
+HonestDiD::createSensitivityPlot_relativeMagnitudes(delta_rm_results_le, originalResults_le)
+
+delta_rm_results_avg <-
+HonestDiD::createSensitivityResults_relativeMagnitudes(betahat = betahat_le,
+                                    sigma = sigma_le,
+                                    numPrePeriods = 2,
+                                    numPostPeriods = 4, Mbarvec = seq(0,1,by=0.2),
+                                    l_vec = basisVector(2,4))
+
+originalResults_avg <- HonestDiD::constructOriginalCS(betahat = betahat_le,
+                                                  sigma = sigma_le,
+                                                  numPrePeriods = 2,
+                                                  numPostPeriods = 4,
+                                                  l_vec = basisVector(2,4))
+
+HonestDiD::createSensitivityPlot_relativeMagnitudes(delta_rm_results_avg, originalResults_avg)
+```
+
+```{r}
+#Honest DID sensitivity analysis
+delta_sd_results_oop <-
+  HonestDiD::createSensitivityResults(betahat = betahat_oop,
+                                      sigma = sigma_oop,
+                                      numPrePeriods = 2,
+                                      numPostPeriods = 4,
+                                      Mvec = seq(from = 0, to = 0.05, by =0.01))
+
+delta_sd_results
+
+#plot
+createSensitivityPlot(delta_sd_results_oop, originalResults_oop)
+
+```
+
+
+```{r}
+#Q9 Implement Borusyak et al. 2021 using did2s
+
+####For Out of pocket 
+oop_borusyak<-
+did2s(HRSsample,
+  yname = "oop_spend", first_stage = ~ 0 | hhidpn + wave,
+  second_stage = ~ i(evt_time, ref = c(-1,-4)), treatment = "treated",
+  cluster_var = "hhidpn")
+etable(oop_borusyak)
+iplot(oop_borusyak,main = "Effect on Out of Pocket Spending (Borusyak et al. 2021)", xlab = "Relative time to treatment (in wave)", xlim = c(-3,2), col = "steelblue", ref.line = -1)
+
+###For labor earnings
+ind_borusyak<-
+did2s(HRSsample,
+  yname = "riearnsemp", first_stage = ~ 0 | hhidpn + wave,
+  second_stage = ~ i(evt_time, ref = c(-1,-4)), treatment = "treated",
+  cluster_var = "hhidpn")
+etable(ind_borusyak)
+iplot(ind_borusyak,main = "Effect on Labor Earnings (Borusyak et al. 2021)", xlab = "Relative time to treatment (in wave)", xlim = c(-3,2), col = "steelblue", ref.line = -1)
+
+```
+
